@@ -1,0 +1,6 @@
+name = "apogee-crypt"
+lib = "src/crypt.grav"
+grav = ">=1.10.0"
+paths = ["src"]
+
+[dependencies]
