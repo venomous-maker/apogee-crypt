@@ -1,0 +1,108 @@
+// apogee-crypt's tests: ChaCha20 against RFC 8439's test vector, sealing and
+// opening text and values, tampering, wrong and rotated keys, the facade, and
+// signed messages (purposes, expiry, rotation).
+import "std"
+import "../src/crypt.grav"
+use apogee.*
+
+const KEY: string = "base64:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
+test "ChaCha20 matches RFC 8439's test vector (2.4.2)" {
+    let key = Bytes.fromHex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+    let nonce = Bytes.fromHex("000000000000004a00000000")
+    let plain = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
+    let out = ChaCha20.xor(key, nonce, 1, Bytes.fromString(plain)).toHex()
+    assertEq(out.length, plain.length * 2)
+    assertEq(out[..32], "6e2e359a2568f98041ba0728dd0d6981")
+    assertEq(out[out.length - 32..], "0bbf74a35be6b40b8eedf2785e42874d")
+    assertEq(ChaCha20.xor(key, nonce, 1, Bytes.fromHex(out)).toString(), plain)
+}
+
+test "text sealed and opened" {
+    let e = new Encrypter(KEY)
+    let sealed = e.encryptString("héllo, wörld")
+    assert(Str.startsWith(sealed, "v1."))
+    assert(!Str.contains(sealed, "llo"))
+    assertEq(e.decryptString(sealed), "héllo, wörld")
+    assert(e.encryptString("same") != e.encryptString("same"))   // a new nonce each time
+    assertEq(e.decryptString(e.encryptString("")), "")
+}
+
+test "values sealed and opened" {
+    let e = new Encrypter(KEY)
+    let cart = new HashMap<string, any>()
+    cart.put("items", [1, 2, 3])
+    cart.put("coupon", "SPRING")
+    cart.put("paid", false)
+    let back = e.decrypt(e.encrypt(cart)) as HashMap<string, any>
+    assertEq(back.get("coupon") as string, "SPRING")
+    assertEq((back.get("items") as Array<any>).size(), 3)
+    assertEq(back.get("paid") as bool, false)
+    assertEq(e.decrypt(e.encrypt(42)) as long, 42 as long)
+    assert(e.decrypt(e.encrypt(null)) == null)
+}
+
+fn fails(e: Encrypter, payload: string) -> bool {
+    try { e.decryptString(payload); return false; }
+    catch (x: DecryptException) { return true; }
+}
+
+test "a changed, foreign or malformed payload does not open" {
+    let e = new Encrypter(KEY)
+    let sealed = e.encryptString("secret")
+    let dot = Str.lastIndexOf(sealed, ".")
+    let flipped = sealed[..4] + (sealed[4] == ('A' as byte) ? "B" : "A") + sealed[5..]
+    assert(fails(e, flipped))
+    assert(fails(e, sealed[..dot] + ".00"))
+    assert(fails(e, "garbage"))
+    assert(fails(e, ""))
+    assert(fails(new Encrypter(Crypt.generateKey()), sealed))
+}
+
+test "previous keys still open what they sealed" {
+    let old = new Encrypter(KEY)
+    let sealed = old.encryptString("from before the rotation")
+    let rotated = new Encrypter(Crypt.generateKey(), [KEY])
+    assertEq(rotated.decryptString(sealed), "from before the rotation")
+    assert(fails(old, rotated.encryptString("new")))      // new payloads use the new key
+}
+
+test "keys: too short is an error, generated ones work" {
+    let short = false
+    try { new Encrypter("too short"); } catch (e: ValueError) { short = true; }
+    assert(short)
+    let k = Crypt.generateKey()
+    assert(Str.startsWith(k, "base64:"))
+    assertEq(Base64.decodeBytes(k[7..]).size(), 32)
+    let plain = new Encrypter("a plain passphrase of 32+ characters!")
+    assertEq(plain.decryptString(plain.encryptString("ok")), "ok")
+}
+
+test "the Crypt facade" {
+    Crypt.setKey(KEY)
+    assertEq(Crypt.decryptString(Crypt.encryptString("x")), "x")
+    assertEq(Crypt.decrypt(Crypt.encrypt("y")) as string, "y")
+}
+
+test "signed messages: purposes, tampering and rotation" {
+    let s = new MessageSigner(KEY)
+    let token = s.sign("user:42", "password-reset")
+    assertEq(s.unsign(token, "password-reset"), "user:42")
+    assert(!s.isValid(token, "invite"))                        // another purpose
+    assert(!s.isValid("eX" + token[2..], "password-reset"))                 // the message changed
+    assert(!s.isValid("nonsense"))
+    assert(!new MessageSigner(Crypt.generateKey()).isValid(token, "password-reset"))
+    let rotated = new MessageSigner(Crypt.generateKey(), [KEY])
+    assertEq(rotated.unsign(token, "password-reset"), "user:42")
+    assertEq(s.unsign(s.sign("a.b.c")), "a.b.c")             // dots in the message
+}
+
+test "signed messages expire" {
+    let s = new MessageSigner(KEY)
+    let token = s.sign("invite:7", "invite", 1)
+    assert(s.isValid(token, "invite"))
+    Time.sleepMs(2100)
+    let expired = false
+    try { s.unsign(token, "invite"); } catch (e: InvalidSignature) { expired = e.expired; }
+    assert(expired)
+}
