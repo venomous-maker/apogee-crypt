@@ -1,0 +1,286 @@
+// crypt.grav — encryption and signing for Apogee: values sealed under the
+// app's key (no one without it reads or alters them), and messages signed so
+// they can be handed out and trusted when they come back (reset links, invite
+// tokens), optionally until a deadline.
+//
+//   Crypt.setKey(env("APP_KEY"))                    // "base64:..." from Crypt.generateKey()
+//   let sealed = Crypt.encrypt(cart)                // any JSON-plain value
+//   let back = Crypt.decrypt(sealed) as HashMap<string, any>
+//
+//   let signer = new MessageSigner(env("APP_KEY"))
+//   let token = signer.sign("user:42", "password-reset", 3600)    // valid for an hour
+//   let who = signer.unsign(token, "password-reset")              // "user:42", or InvalidSignature
+//
+// Encryption is ChaCha20 (RFC 8439) with a random 96-bit nonce, then
+// HMAC-SHA256 over the result (encrypt-then-MAC), with separate keys for the
+// two derived from the app key. A payload reads "v1.<data>.<mac>", <data> in
+// URL-safe Base64, so it fits in a cookie, a URL or a JSON string. Previous
+// keys can be kept so that values sealed before a key rotation still open.
+import "std"
+
+namespace apogee {
+
+    %{
+    #include <stdint.h>
+    #include <string.h>
+    static uint32_t grav_cc_rotl(uint32_t v, int n) { return (v << n) | (v >> (32 - n)); }
+    #define GRAV_CC_QR(a, b, c, d) \
+        a += b; d ^= a; d = grav_cc_rotl(d, 16); c += d; b ^= c; b = grav_cc_rotl(b, 12); \
+        a += b; d ^= a; d = grav_cc_rotl(d, 8);  c += d; b ^= c; b = grav_cc_rotl(b, 7);
+    static uint32_t grav_cc_le32(const unsigned char* p) {
+        return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    }
+    /* One 64-byte ChaCha20 keystream block (RFC 8439, 2.3). */
+    static void grav_cc_block(const unsigned char* key, uint32_t counter, const unsigned char* nonce, unsigned char* out) {
+        uint32_t s[16], x[16];
+        s[0] = 0x61707865; s[1] = 0x3320646e; s[2] = 0x79622d32; s[3] = 0x6b206574;
+        for (int i = 0; i < 8; i++) s[4 + i] = grav_cc_le32(key + 4 * i);
+        s[12] = counter;
+        for (int i = 0; i < 3; i++) s[13 + i] = grav_cc_le32(nonce + 4 * i);
+        memcpy(x, s, sizeof s);
+        for (int r = 0; r < 10; r++) {
+            GRAV_CC_QR(x[0], x[4], x[8], x[12]) GRAV_CC_QR(x[1], x[5], x[9], x[13])
+            GRAV_CC_QR(x[2], x[6], x[10], x[14]) GRAV_CC_QR(x[3], x[7], x[11], x[15])
+            GRAV_CC_QR(x[0], x[5], x[10], x[15]) GRAV_CC_QR(x[1], x[6], x[11], x[12])
+            GRAV_CC_QR(x[2], x[7], x[8], x[13]) GRAV_CC_QR(x[3], x[4], x[9], x[14])
+        }
+        for (int i = 0; i < 16; i++) {
+            uint32_t v = x[i] + s[i];
+            out[4 * i] = (unsigned char)v; out[4 * i + 1] = (unsigned char)(v >> 8);
+            out[4 * i + 2] = (unsigned char)(v >> 16); out[4 * i + 3] = (unsigned char)(v >> 24);
+        }
+    }
+    /* data ^= the keystream from block `counter` on, in place. */
+    static void grav_cc_xor(const unsigned char* key, const unsigned char* nonce, uint32_t counter,
+                            unsigned char* data, int n) {
+        unsigned char ks[64];
+        for (int at = 0; at < n; at += 64, counter++) {
+            grav_cc_block(key, counter, nonce, ks);
+            int m = n - at < 64 ? n - at : 64;
+            for (int i = 0; i < m; i++) data[at + i] ^= ks[i];
+        }
+    }
+    %}
+
+    // A payload that was not made with any of the keys, was altered, or is not
+    // one at all.
+    class DecryptException extends Exception {
+        constructor(message: string) { super(message); }
+    }
+
+    // A signed message that does not verify: altered, signed for another
+    // purpose or with another key, or past its deadline (`expired` then).
+    class InvalidSignature extends Exception {
+        public expired: bool
+        constructor(message: string, expired: bool = false) { super(message); self.expired = expired; }
+    }
+
+    // The ChaCha20 stream cipher (RFC 8439): `data` XORed with the keystream of a
+    // 32-byte key and a 12-byte nonce, starting at block `counter`. Encrypting
+    // and decrypting are the same operation. Never reuse a key and nonce pair.
+    class ChaCha20 {
+        static fn xor(key: Bytes, nonce: Bytes, counter: long, data: Bytes) -> Bytes {
+            if (key.size() != 32) { throw new ValueError("a ChaCha20 key is 32 bytes, got ${key.size()}"); }
+            if (nonce.size() != 12) { throw new ValueError("a ChaCha20 nonce is 12 bytes, got ${nonce.size()}"); }
+            let out = data.copy();
+            let k = key.rawData();
+            let iv = nonce.rawData();
+            let p = out.rawData();
+            let n = out.size();
+            let c = counter;
+            %{ grav_cc_xor(k, iv, (uint32_t)c, p, n); %};
+            return out;
+        }
+    }
+
+    // Turns a value into the JSON text that gets encrypted, and back: null,
+    // bool, numbers, strings, DateTime (as its text), and Array<any> /
+    // HashMap<string, any> of those.
+    class CryptValue {
+        static fn encode(v: any) -> string { return CryptValue.toJson(v).toJson(); }
+        static fn decode(text: string) -> any { return CryptValue.fromJson(Json.parse(text)); }
+        private static fn toJson(v: any) -> JsonValue {
+            if (v == null) { return Json.nil(); }
+            if (v is bool) { return Json.of(v as bool); }
+            if (v is long) { return Json.of(v as long); }
+            if (v is int) { return Json.of((v as int) as long); }
+            if (v is float) { return Json.of(v as float); }
+            if (v is double) { return Json.of(v as double); }
+            if (v is string) { return Json.of(v as string); }
+            if (v is DateTime) { return Json.of((v as DateTime).toString()); }
+            if (v is JsonValue) { return v as JsonValue; }
+            if (v is HashMap<string, any>) {
+                let o = Json.object();
+                for ((k, x) in v as HashMap<string, any>) { o.set(k, CryptValue.toJson(x)); }
+                return o;
+            }
+            if (v is Array<any>) {
+                let a = Json.array();
+                for (x in v as Array<any>) { a.push(CryptValue.toJson(x)); }
+                return a;
+            }
+            throw new ValueError("encrypted values are JSON-plain (null, bool, numbers, strings, DateTime, " +
+                                 "Array/HashMap of those): got " + typename(v));
+        }
+        private static fn fromJson(j: JsonValue) -> any {
+            if (j.isNull()) { return null; }
+            if (j.isBool()) { return j.asBool(); }
+            if (j.isInteger()) { return j.asLong(); }
+            if (j.isNumber()) { return j.asFloat(); }
+            if (j.isString()) { return j.asString(); }
+            if (j.isArray()) {
+                let out = new Array<any>();
+                for (x in j.asArray()) { out.push(CryptValue.fromJson(x)); }
+                return out;
+            }
+            let out = new HashMap<string, any>();
+            for ((k, x) in j.entries()) { out.put(k, CryptValue.fromJson(x)); }
+            return out;
+        }
+    }
+
+    // The two keys one app key gives: one to encrypt with, one to MAC with.
+    class CryptKeys {
+        public enc: Bytes
+        public mac: string
+        constructor(appKey: string) {
+            let secret = CryptKeys.secret(appKey);
+            self.enc = Bytes.fromHex(Hash.hmacSha256(secret, "apogee-crypt/encrypt/v1"));
+            self.mac = Hash.hmacSha256(secret, "apogee-crypt/mac/v1");
+        }
+        // The key's bytes, as text to HMAC with: "base64:..." decoded (to hex), else
+        // the key itself, which must be at least 32 characters.
+        static fn secret(appKey: string) -> string {
+            if (Str.startsWith(appKey, "base64:")) {
+                let b = Base64.decodeBytes(appKey[7..]);
+                if (b.size() < 32) { throw new ValueError("the key is ${b.size()} bytes; it needs at least 32 (Crypt.generateKey())"); }
+                return b.toHex();
+            }
+            if (appKey.length < 32) {
+                throw new ValueError("the key is ${appKey.length} characters; it needs at least 32 (Crypt.generateKey())");
+            }
+            return appKey;
+        }
+    }
+
+    // Seals values under a key, and opens them under it or one of the keys it
+    // replaced.
+    class Encrypter {
+        private current: CryptKeys
+        private all: Array<CryptKeys>
+
+        // `key`: "base64:" and 32 random bytes (Crypt.generateKey()), or any text of
+        // 32 characters or more. `previousKeys`: keys this one replaced.
+        constructor(key: string, previousKeys: Array<string> = new Array<string>()) {
+            self.current = new CryptKeys(key);
+            self.all = new Array<CryptKeys>();
+            self.all.push(self.current);
+            for (k in previousKeys) { self.all.push(new CryptKeys(k)); }
+        }
+
+        // `text` sealed: "v1.<data>.<mac>".
+        fn encryptString(text: string) -> string {
+            let nonce = Bytes.fromHex(Hash.randomToken(12));
+            let sealed = ChaCha20.xor(self.current.enc, nonce, 1, Bytes.fromString(text));
+            let body = new Bytes(12 + sealed.size());
+            body.append(nonce).append(sealed);
+            let head = "v1." + Encrypter.b64url(body);
+            return head + "." + Hash.hmacSha256(self.current.mac, head);
+        }
+
+        // The text inside a payload; DecryptException when no key made it or it
+        // was changed.
+        fn decryptString(payload: string) -> string {
+            let dot = Str.lastIndexOf(payload, ".");
+            if (!Str.startsWith(payload, "v1.") || dot <= 3) { throw new DecryptException("not an encrypted payload"); }
+            let head = payload[..dot];
+            let mac = payload[dot + 1..];
+            for (k in self.all) {
+                if (!Hash.equals(mac, Hash.hmacSha256(k.mac, head))) { continue; }
+                let body: Bytes = null;
+                try { body = Base64.decodeBytes(head[3..]); }
+                catch (e: ValueError) { throw new DecryptException("the payload's data is not Base64"); }
+                if (body.size() < 12) { throw new DecryptException("the payload is too short"); }
+                let plain = ChaCha20.xor(k.enc, body.slice(0, 12), 1, body.slice(12, body.size()));
+                return plain.toString();
+            }
+            throw new DecryptException("the payload was not made with this key, or was changed");
+        }
+
+        // A JSON-plain value sealed (see CryptValue).
+        fn encrypt(value: any) -> string { return self.encryptString(CryptValue.encode(value)); }
+        // The value inside a payload made by encrypt().
+        fn decrypt(payload: string) -> any {
+            let text = self.decryptString(payload);
+            try { return CryptValue.decode(text); }
+            catch (e: ValueError) { throw new DecryptException("the payload does not hold an encrypted value"); }
+        }
+
+        // URL-safe Base64 without padding.
+        static fn b64url(b: Bytes) -> string {
+            let s = Str.replace(Str.replace(Base64.encodeBytes(b), "+", "-"), "/", "_");
+            while (Str.endsWith(s, "=")) { s = s[..s.length - 1]; }
+            return s;
+        }
+    }
+
+    // Signs messages so they can be handed out and trusted when they come back:
+    // "<message>.<expires>.<signature>", the message readable but not
+    // changeable. A purpose ("password-reset", "invite") is signed with it, so a
+    // token made for one cannot be used for another.
+    class MessageSigner {
+        private keys: Array<string>
+        constructor(key: string, previousKeys: Array<string> = new Array<string>()) {
+            self.keys = new Array<string>();
+            self.keys.push(Hash.hmacSha256(CryptKeys.secret(key), "apogee-crypt/sign/v1"));
+            for (k in previousKeys) { self.keys.push(Hash.hmacSha256(CryptKeys.secret(k), "apogee-crypt/sign/v1")); }
+        }
+        // `message` signed for `purpose`, valid for `ttlSeconds` (0: always).
+        fn sign(message: string, purpose: string = "", ttlSeconds: long = 0) -> string {
+            let expires = ttlSeconds > 0 ? Time.now() + ttlSeconds : 0;
+            let head = Encrypter.b64url(Bytes.fromString(message)) + "." + str(expires);
+            return head + "." + Hash.hmacSha256(self.keys[0], purpose + "|" + head);
+        }
+        // The message inside `signed`; InvalidSignature when it does not verify for
+        // `purpose`, or has expired.
+        fn unsign(signed: string, purpose: string = "") -> string {
+            let last = Str.lastIndexOf(signed, ".");
+            let head = last > 0 ? signed[..last] : "";
+            let mid = Str.lastIndexOf(head, ".");
+            if (last < 0 || mid < 0) { throw new InvalidSignature("not a signed message"); }
+            let sig = signed[last + 1..];
+            let ok = false;
+            for (k in self.keys) { if (Hash.equals(sig, Hash.hmacSha256(k, purpose + "|" + head))) { ok = true; break; } }
+            if (!ok) { throw new InvalidSignature("the signature does not match"); }
+            let expires = Integer.parseOr(head[mid + 1..], -1);
+            if (expires < 0) { throw new InvalidSignature("not a signed message"); }
+            if (expires > 0 && expires < Time.now()) { throw new InvalidSignature("the signed message has expired", true); }
+            return Base64.decode(head[..mid]);
+        }
+        // Whether `signed` verifies for `purpose` and has not expired.
+        fn isValid(signed: string, purpose: string = "") -> bool {
+            try { self.unsign(signed, purpose); return true; }
+            catch (e: InvalidSignature) { return false; }
+        }
+    }
+
+    // The app's encrypter, as statics (set its key once at boot).
+    class Crypt {
+        private static encrypter: Encrypter = null
+        static fn setKey(key: string, previousKeys: Array<string> = new Array<string>()) {
+            Crypt.encrypter = new Encrypter(key, previousKeys);
+        }
+        static fn use(e: Encrypter) { Crypt.encrypter = e; }
+        static fn instance() -> Encrypter {
+            let e = Crypt.encrypter;
+            if (e == null) { throw new StateError("no encryption key: call Crypt.setKey(env(\"APP_KEY\")) first"); }
+            return e;
+        }
+        // A new random key: "base64:" and 32 random bytes.
+        static fn generateKey() -> string { return "base64:" + Base64.encodeBytes(Bytes.fromHex(Hash.randomToken(32))); }
+        static fn encrypt(value: any) -> string { return Crypt.instance().encrypt(value); }
+        static fn decrypt(payload: string) -> any { return Crypt.instance().decrypt(payload); }
+        static fn encryptString(text: string) -> string { return Crypt.instance().encryptString(text); }
+        static fn decryptString(payload: string) -> string { return Crypt.instance().decryptString(payload); }
+    }
+}
