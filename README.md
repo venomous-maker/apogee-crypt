@@ -6,7 +6,7 @@ messages signed so they can be handed out (reset links, invite tokens) and
 trusted when they come back, optionally until a deadline. No dependencies
 beyond Grav's standard library, and no OpenSSL.
 
-```grav
+```typescript
 import "std"
 import "apogee-crypt"
 use apogee.*
