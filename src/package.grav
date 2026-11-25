@@ -1,0 +1,27 @@
+// package.grav — how apogee-crypt connects itself to an app (apogee-package):
+// Crypt with the app key, and app.previous_keys (comma-separated) to read what
+// older keys sealed; a MessageSigner bound in the container.
+import "std"
+import "apogee-container"
+import "apogee-config"
+import "apogee-package"
+import "crypt.grav"
+
+namespace apogee {
+
+    class CryptPackage extends ApogeePackage {
+        constructor() {}
+        fn name() -> string { return "crypt"; }
+        fn defaults() -> HashMap<string, any> { return {"app.previous_keys": Env.get("APP_PREVIOUS_KEYS", "")}; }
+        fn register(app: PackageContext) {
+            // (a key too short to encrypt with: the app still starts, and Crypt says why when first used)
+            try {
+                let e = new Encrypter(app.key, PackageContext.list(Config.getString("app.previous_keys")));
+                Crypt.use(e);
+                app.container.instance::<Encrypter>(e);
+            } catch (x: ValueError) {}
+            let key = app.key;
+            app.container.singleton::<MessageSigner>(fn(c: Container) -> MessageSigner { return new MessageSigner(key); });
+        }
+    }
+}
