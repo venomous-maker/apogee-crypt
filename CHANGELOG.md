@@ -6,6 +6,11 @@ compiler versions it builds with.
 
 ## Unreleased
 
+Needs grav 1.12.0 or newer.
+
+- `CryptPackage`: the module connects itself to an apogee-framework app (apogee-package):
+  its settings, wiring moved here from the framework.
+
 ## 0.1.0 (2026-11-20)
 
 The first release. Needs grav 1.10.0 or newer.
