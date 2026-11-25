@@ -20,6 +20,17 @@ let token = signer.sign("user:42", "password-reset", 3600)   // valid for an hou
 let who = signer.unsign(token, "password-reset")             // "user:42", or InvalidSignature
 ```
 
+## In an apogee-framework app
+
+Importing the module is all it takes: `CryptPackage` (apogee-package) connects it when
+the app is created. Crypt uses the app key (`APP_KEY`), and a `MessageSigner` is bound in the container. A key too short to encrypt with does not stop the app; Crypt says why when first used.
+
+| Setting | Default |
+|---|---|
+| `app.previous_keys` | `APP_PREVIOUS_KEYS`: older keys, comma-separated, still read |
+
+Your own configuration wins over these defaults.
+
 ## Encrypting
 
 | | |
@@ -54,4 +65,5 @@ pass as a `"password-reset"` one.
 
 ```bash
 grav test tests/crypt.grav
+grav test tests/package.grav
 ```
