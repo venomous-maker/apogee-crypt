@@ -1,0 +1,20 @@
+// CryptPackage: Crypt and a MessageSigner from the app key.
+import "std"
+import "apogee-container"
+import "apogee-config"
+import "apogee-package"
+import "../src/all.grav"
+use apogee.*
+
+test "the package connects itself" {
+    let ps = Packages.discover()
+    assertEq(ps.size(), 1)
+    assertEq(ps[0].name(), "crypt")
+    Packages.applyDefaults(ps)
+    let c = new Container()
+    let key = "base64:" + Base64.encodeBytes(Crypto.randomBytes(32))
+    ps[0].register(new PackageContext(c, "testing", key))
+    assertEq(Crypt.decryptString(Crypt.encryptString("hello")), "hello")
+    assert(c.make::<MessageSigner>() != null)
+    ps[0].register(new PackageContext(new Container(), "testing", "short"))   // a key too short: the app still starts
+}
